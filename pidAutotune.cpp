@@ -11,11 +11,12 @@
 int sample = 0;
 
 double topOUT,botOUT,OUT_range[2]={0,225}; 
-double triggre_mid,triggre_top,triggre_bot,trig_distance;
+double triggre_mid,triggre_top,triggre_bot;
+const double trig_distance=2;
 double react_max,react_min,cur_react; //reaction signal peek
 double kU,pU,outDis,reactDis;
-double t1,t2,save1,save2;
-const int cycle=5;
+double t1,t2,save1;
+const int cycle=5, wait= 100;//cycles, ms;
 double kP[cycle]={},kI[cycle]={},kD[cycle]={};
 double kPavg,kIavg,kDavg;
 bool pikachu,ending=false;
@@ -58,13 +59,17 @@ void loop() {
 /*-----------------------------------------------------------------*/
 void tunePID() {
     if (sample<1){
-        //write the top Ouput to device
+        pwmOut(botOUT,botOUT,c_clkw,clkw);
+        delay(wait);
         pwmOut(topOUT,topOUT,c_clkw,clkw);
-        //---------------------------------------
+        delay(wait);
+        triggre_mid = (react_max+react_min)/2;
+        triggre_top = triggre_mid + trig_distance/2;
+        triggre_bot = triggre_mid - trig_distance/2;
         pikachu=true;
         sample ++;
     }
-    else if (pikachu=true && cur_react>triggre_top) {
+    else if (pikachu=true && cur_react>=triggre_top) {
         if (sample == 1) {
             t1 = micros();
             pikachu = false;
@@ -86,7 +91,7 @@ void tunePID() {
             sample ++;
         }
     }
-    else if (pikachu = false && cur_react<triggre_bot) {
+    else if (pikachu = false && cur_react<=triggre_bot) {
         pikachu=true;
         //write the top Ouput to device
         pwmOut(topOUT,topOUT,c_clkw,clkw);
@@ -101,7 +106,7 @@ void calTune(double pU, double A, double D){
     kD[sample-1] = 0.075*kU*pU;
 }
 bool end_() {
-    for(int i=0;i<=cycle;i++){
+    for(int i=0;i<=cycle-1;i++){
         kPavg+=kP[i];
         kIavg+=kI[i];
         kDavg+=kD[i];
@@ -154,11 +159,13 @@ void pwmOut(int Lpwm, int Rpwm, bool Ldir, bool Rdir){
 }
 /*-----------------------------------------------------------------*/
 ISR(TIMER1_OVF_vect) {
-    int _p;
-    _p=(abs(r_p)+abs(l_p))/2;
-    react_max= max(cur_react,_p);
-    react_min= min(cur_react,_p);
-    cur_react= _p ;
+    if (sample<1){
+      int _p;
+      _p=(abs(r_p)+abs(l_p))/2;
+      react_max= max(cur_react,_p);
+      react_min= min(cur_react,_p);
+      cur_react= _p ;
+      }
 
     l_p=0;
     r_p=0;
