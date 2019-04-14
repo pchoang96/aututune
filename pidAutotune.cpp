@@ -7,19 +7,20 @@
 #define M2_p        5
 #define M2_l        4
 #define DEBUG       1
+/*-----------------------------------------------------------------------------------------------*/
 //turning parametters
-int sample = 0;
-
+const int cycle=24, wait= 300;//cycles, ms;
 double topOUT,botOUT,OUT_range[2]={0,225}; 
 double triggre_mid,triggre_top,triggre_bot;
 const double trig_distance=2;
 double react_max,react_min,cur_react; //reaction signal peek
 double kU,pU,outDis,reactDis;
 double t1,t2,save1;
-const int cycle=5, wait= 100;//cycles, ms;
+volatile int sample = 0,i=0;
 double kP[cycle]={},kI[cycle]={},kD[cycle]={};
 double kPavg,kIavg,kDavg;
 bool pikachu,ending=false;
+/*-----------------------------------------------------------------------------------------------*/
 //control parameters
 const double sampletime = 0.02, inv_sampletime = 1/sampletime,timer_set=65535-sampletime*250000;
 int l_p=0,r_p=0;
@@ -29,6 +30,7 @@ bool l_dir = clkw, r_dir = clkw;
 const double pi=3.141592654;
 
 void setup(){
+    Serial.begin(9600);
     pinMode(M1_l,OUTPUT);
     pinMode(M2_l,OUTPUT);
     pinMode(encodPinA1, INPUT_PULLUP);                  // encoder input pin
@@ -42,10 +44,11 @@ void setup(){
     TCCR1B |= (1 << CS11) | (1 << CS10);    // prescale = 64 4us per pulse
     TCNT1 = timer_set; //(12500*4)=50ms
     TIMSK1 |= (1 << TOIE1);                  // Overflow interrupt enable 
-    sei();                                  // enable all interrupt
+    
     /*preset the output jump distance*/
     topOUT = OUT_range[0]+(OUT_range[1]-OUT_range[0])*3/4;
     botOUT = OUT_range[0]+(OUT_range[1]+OUT_range[0])*1/4;
+    sei();    
 }
 /*-----------------------------------------------------------------*/
 void loop() {
@@ -53,6 +56,7 @@ void loop() {
         tunePID();
         if (sample>=cycle){
             ending = end_();
+            Serial.println((String) kPavg +" "+ kIavg +" " + kDavg );
         }
     }
 }
@@ -60,60 +64,84 @@ void loop() {
 void tunePID() {
     if (sample<1){
         pwmOut(botOUT,botOUT,c_clkw,clkw);
-        delay(wait);
+        delay(wait);        
+        react_min = cur_react;     
         pwmOut(topOUT,topOUT,c_clkw,clkw);
-        delay(wait);
+        delay(wait);      
         triggre_mid = (react_max+react_min)/2;
         triggre_top = triggre_mid + trig_distance/2;
         triggre_bot = triggre_mid - trig_distance/2;
+        Serial.println((String) "top = " + triggre_top + " bot: " + triggre_bot);
         pikachu=true;
         sample ++;
     }
-    else if (pikachu=true && cur_react>=triggre_top) {
-        if (sample == 1) {
+    if (pikachu==true && cur_react>=triggre_top) {
+        if (sample == 1&&i==0) {
+            Serial.println((String) "im going in 1");
             t1 = micros();
             pikachu = false;
-            //write the bot Ouput to device
             pwmOut(botOUT,botOUT,c_clkw,clkw);
+            i++;
             //---------------------------------------
         } 
         else {
+            react_max=cur_react;
+            Serial.println((String) "im going in 2");
             t2=micros();
-            save1= t2-t1; //this is pU
-            outDis=topOUT-botOUT;
-            reactDis = react_max -react_min;
+            save1= (t2-t1)/1000000;
+            outDis=(topOUT-botOUT)/2;
+            reactDis = (react_max -react_min)/2;
             calTune(save1,reactDis,outDis);
-            pikachu = false;
-            //write the bot Ouput to device
             pwmOut(botOUT,botOUT,c_clkw,clkw);
             //---------------------------------
+            pikachu = false;
             t1=micros();
             sample ++;
         }
     }
-    else if (pikachu = false && cur_react<=triggre_bot) {
+    else if (pikachu == false && cur_react<triggre_bot) {
+        Serial.println((String) "im going in 3");
+        react_min=cur_react;
         pikachu=true;
         //write the top Ouput to device
         pwmOut(topOUT,topOUT,c_clkw,clkw);
         //---------------------------------------
     }
-
 }
 void calTune(double pU, double A, double D){
-    double kU=4*D/(A*pi);
+    // Calculate Ku (ultimate gain)
+    // Formula given is Ku = 4d / πa
+    // d is the amplitude of the output signal
+    // a is the amplitude of the input signal
+    double kU= (4*D)/(A*pi);
+    // How gains are calculated
+    // PID control algorithm needs Kp, Ki, and Kd
+    // Ziegler-Nichols tuning method gives Kp, Ti, and Td
+    //
+    // Kp = 0.6Ku = Kc
+    // Ti = 0.5Tu = Kc/Ki
+    // Td = 0.125Tu = Kd/Kc
+    //
+    // Solving these equations for Kp, Ki, and Kd gives this:
+    //
+    // Kp = 0.6Ku
+    // Ki = 1.2*kU/pU;
+    // Kd = 0.075*kU*pU;
+    
     kP[sample-1] = 0.6*kU;
-    kI[sample-1] = 1.2*kU/pU;
-    kD[sample-1] = 0.075*kU*pU;
+    kI[sample-1] = 2*kP[sample-1]/pU;
+    kD[sample-1] = kP[sample-1]*pU/8;
 }
 bool end_() {
-    for(int i=0;i<=cycle-1;i++){
+    for(int i=0;i<=cycle-2;i++){
         kPavg+=kP[i];
         kIavg+=kI[i];
         kDavg+=kD[i];
     }
-    kPavg=kPavg/cycle;
-    kIavg=kIavg/cycle;
-    kDavg=kDavg/cycle;
+    kPavg=(kPavg/(cycle-1));
+    kIavg=(kIavg/(cycle-1));
+    kDavg=(kDavg/(cycle-1));
+    pwmOut(0,0,0,0);
     return true;
 }
 /*-------------------encoder interrupt 1 ---------------------------------------*/
@@ -159,14 +187,11 @@ void pwmOut(int Lpwm, int Rpwm, bool Ldir, bool Rdir){
 }
 /*-----------------------------------------------------------------*/
 ISR(TIMER1_OVF_vect) {
-    if (sample<1){
-      int _p;
-      _p=(abs(r_p)+abs(l_p))/2;
-      react_max= max(cur_react,_p);
-      react_min= min(cur_react,_p);
-      cur_react= _p ;
-      }
-
+     cur_react=((r_p+l_p)/2)/sampletime;
+     if (sample<1) {
+        if (cur_react>react_max) react_max=cur_react;
+     }
+   // Serial.println(cur_react);
     l_p=0;
     r_p=0;
     TCNT1 =timer_set;
