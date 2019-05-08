@@ -1,0 +1,320 @@
+#include <Fuzzy.h>
+#define clkw        0
+#define c_clkw      1
+
+#define encodPinA1  3
+#define M1_p        6
+#define M1_l        7
+#define encodPinA2  2
+#define M2_p        5
+#define M2_l        4
+#define DEBUG       0
+
+enum Error {
+  ENB  = -40,
+  ENN  = -25,
+  ENF  = -8,
+  EZ   = 0,
+  EPF  = 1,
+  EPN  = 10,
+  EPB  = 40
+};
+float PO = 0, PL = 0.26, PG = 0.39, PM = 4.24;
+float IO = 0, IL = 7.2, IG = 9.68, IM = 16.78;
+/*--------------------------------------------------------------------------------------------------------------------------------------------*/
+volatile double ang_vel = 0, lin_vel = 0;
+double l_v, l_vt;
+double r_v, r_vt; // pwm: pwm output. lv: mm/sec. lvt: tic/delta_t l:lert, r: right
+bool l_dir = clkw, r_dir = clkw;
+/**-----------------------pid velocity calculation-------------------------------------------**/
+volatile double  l_error = 0.0, l_pre_error = 0.0, l_integral = 0.0, l_derivative = 0.0, l_Ppart = 0.0, l_Ipart = 0.0, l_Dpart = 0.0, l_out, l_set, l_ms, l_pre_out = 0;
+//double const l_kP = 0.72, l_kI=25.205 ,l_kD = 0.005;
+float l_kP = 0, l_kI = 0, l_kD = 0.01;
+volatile double  r_error = 0.0, r_pre_error = 0.0, r_integral = 0.0, r_derivative = 0.0, r_Ppart = 0.0, r_Ipart = 0.0, r_Dpart = 0.0, r_out, r_set, r_ms, r_pre_out = 0;
+double r_kP = 0, r_kI = 0, r_kD = 0.01;
+//double const r_kP = 0.72, r_kI=25.205,r_kD = 0.005;
+/**--------------------------car parameter-----------------------------------------------**/
+const double pi = 3.1415;
+const double sampletime = 0.02, inv_sampletime = 1 / sampletime, timer_set = 65535 - sampletime * 250000;
+const double wheels_distance = 207, wheels_radius = 31, wheels_diameter = 62, wheels_encoder = 440 ; // mm
+const double wheel_ticLength = wheels_diameter * pi / wheels_encoder;
+const double tinkerbell = 1 * inv_sampletime * pi * wheels_diameter / wheels_encoder;
+int l_p = 0, r_p = 0;
+int out2 = 0, out1 = 0;
+double l_d = 0, r_d = 0;
+/*--------------------------------------------------------------------------------------------------------------------------------------------*/
+// Instantiating a Fuzzy object
+Fuzzy *fuzzy = new Fuzzy();
+//-------------------------------------------------------------------
+//error
+FuzzySet *_ENB = new FuzzySet(ENB * 2, ENB * 2, ENB, ENN);
+FuzzySet *_ENN = new FuzzySet(ENB, ENN, ENN, ENF);
+FuzzySet *_ENF = new FuzzySet(ENN, ENF, ENF, EZ);
+FuzzySet *_EZ = new FuzzySet(ENF, EZ, EZ, EPF);
+FuzzySet *_EPF = new FuzzySet(EZ, EPF, EPF, EPN);
+FuzzySet *_EPN = new FuzzySet(EPF, EPN, EPN, EPB);
+FuzzySet *_EPB = new FuzzySet(EPN, EPB, ENB * 2, EPB * 2);
+
+//output kP
+FuzzySet *_PO = new FuzzySet(PO, PO, PO, PL);
+FuzzySet *_PL = new FuzzySet(PO, PL, PL, PG);
+FuzzySet *_PG = new FuzzySet(PL, PG, PG, PM);
+FuzzySet *_PM = new FuzzySet(PG, PM, PM, PM);
+//output kI
+FuzzySet *_IO = new FuzzySet(IO, IO, IO, IL);
+FuzzySet *_IL = new FuzzySet(IO, IL, IL, IG);
+FuzzySet *_IG = new FuzzySet(IL, IG, IG, IM);
+FuzzySet *_IM = new FuzzySet(IG, IM, IM, IM);
+/**/
+//---------------------------------------------------------------------------
+void setup() {
+  //---------------------------------setup hard ware----------------------------------
+  Serial.begin(9600);
+  pinMode(M1_l, OUTPUT);
+  pinMode(M2_l, OUTPUT);
+  pinMode(encodPinA1, INPUT_PULLUP);                  // encoder input pin
+  pinMode(encodPinA2, INPUT_PULLUP);
+  attachInterrupt(0, encoder_1 , FALLING);               // update encoder position
+  attachInterrupt(1, encoder_2 , FALLING);
+  //---------------------------------set up fuzzy algorithm-------------------------------
+  FuzzyInput *_Error = new FuzzyInput(1);
+  _Error->addFuzzySet(_ENB);
+  _Error->addFuzzySet(_ENN);
+  _Error->addFuzzySet(_ENF);
+  _Error->addFuzzySet(_EZ);
+  _Error->addFuzzySet(_EPF);
+  _Error->addFuzzySet(_EPN);
+  _Error->addFuzzySet(_ENB);
+  fuzzy->addFuzzyInput(_Error);
+
+  FuzzyOutput *_KP = new FuzzyOutput(1);
+  _KP->addFuzzySet(_PO);
+  _KP->addFuzzySet(_PL);
+  _KP->addFuzzySet(_PG);
+  _KP->addFuzzySet(_PM);
+  fuzzy->addFuzzyOutput(_KP);
+
+  FuzzyOutput *_KI = new FuzzyOutput(2);
+  _KI->addFuzzySet(_IO);
+  _KI->addFuzzySet(_IL);
+  _KI->addFuzzySet(_IG);
+  _KI->addFuzzySet(_IM);
+  fuzzy->addFuzzyOutput(_KI);
+
+  // Building FuzzyRule-------------------------------------------------------
+  FuzzyRuleAntecedent *IfErrorIsENB = new FuzzyRuleAntecedent();
+  IfErrorIsENB->joinSingle(_ENB);
+
+  FuzzyRuleConsequent *thenKPisPGandKIisIG = new FuzzyRuleConsequent();
+  thenKPisPGandKIisIG->addOutput(_PG);
+  thenKPisPGandKIisIG->addOutput(_IG);
+
+  FuzzyRule *fuzzyRule1 = new FuzzyRule(1, IfErrorIsENB, thenKPisPGandKIisIG);
+  fuzzy->addFuzzyRule(fuzzyRule1);
+
+  // Building FuzzyRule--------------------------------------------------------
+  FuzzyRuleAntecedent *IfErrorIsENN = new FuzzyRuleAntecedent();
+  IfErrorIsENN->joinSingle(_ENN);
+
+  FuzzyRuleConsequent *thenKPisPLandKIisIG = new FuzzyRuleConsequent();
+  thenKPisPLandKIisIG->addOutput(_PG);
+  thenKPisPLandKIisIG->addOutput(_IG);
+
+  FuzzyRule *fuzzyRule2 = new FuzzyRule(2, IfErrorIsENN, thenKPisPLandKIisIG);
+  fuzzy->addFuzzyRule(fuzzyRule2);
+
+  // Building FuzzyRule---------------------------------------------------------
+  FuzzyRuleAntecedent *IfErrorIsENF = new FuzzyRuleAntecedent();
+  IfErrorIsENF->joinSingle(_ENF);
+
+  FuzzyRuleConsequent *thenKPisPLandKIisIL = new FuzzyRuleConsequent();
+  thenKPisPLandKIisIL->addOutput(_PL);
+  thenKPisPLandKIisIL->addOutput(_IL);
+
+  FuzzyRule *fuzzyRule3 = new FuzzyRule(3, IfErrorIsENF, thenKPisPLandKIisIL);
+  fuzzy->addFuzzyRule(fuzzyRule3);
+
+  // Building FuzzyRule-------------------------------------------------------------
+  FuzzyRuleAntecedent *IfErrorIsEZ = new FuzzyRuleAntecedent();
+  IfErrorIsEZ->joinSingle(_EZ);
+
+  FuzzyRuleConsequent *thenKPisPOandKIisIO = new FuzzyRuleConsequent();
+  thenKPisPOandKIisIO->addOutput(_PO);
+  thenKPisPOandKIisIO->addOutput(_IO);
+
+  FuzzyRule *fuzzyRule4 = new FuzzyRule(4, IfErrorIsEZ, thenKPisPOandKIisIO);
+  fuzzy->addFuzzyRule(fuzzyRule4);
+
+  // Building FuzzyRule---------------------------------------------------------
+  FuzzyRuleAntecedent *IfErrorIsEPF = new FuzzyRuleAntecedent();
+  IfErrorIsEPF->joinSingle(_EPF);
+
+  FuzzyRule *fuzzyRule5 = new FuzzyRule(5, IfErrorIsEPF, thenKPisPLandKIisIL);
+  fuzzy->addFuzzyRule(fuzzyRule5);
+
+
+  // Building FuzzyRule--------------------------------------------------------
+  FuzzyRuleAntecedent *IfErrorIsEPN = new FuzzyRuleAntecedent();
+  IfErrorIsEPN->joinSingle(_EPN);
+
+  FuzzyRule *fuzzyRule6 = new FuzzyRule(6, IfErrorIsEPN, thenKPisPLandKIisIG);
+  fuzzy->addFuzzyRule(fuzzyRule6);
+
+  // Building FuzzyRule-------------------------------------------------------
+  FuzzyRuleAntecedent *IfErrorIsEPB = new FuzzyRuleAntecedent();
+  IfErrorIsEPB->joinSingle(_EPB);
+
+  FuzzyRuleConsequent *thenKPisPMandKIisIM = new FuzzyRuleConsequent();
+  thenKPisPMandKIisIM->addOutput(_PM);
+  thenKPisPMandKIisIM->addOutput(_IM);
+
+  FuzzyRule *fuzzyRule7 = new FuzzyRule(7, IfErrorIsEPB, thenKPisPMandKIisIM);
+  fuzzy->addFuzzyRule(fuzzyRule7);
+
+  //---------------------------------setup timer------------------------------------------
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TIMSK1 = 0;
+  TCCR1B |= (1 << CS11) | (1 << CS10);    // prescale = 64 4us per pulse
+  TCNT1 = timer_set;                      //(12500*4)=50ms
+  TIMSK1 |= (1 << TOIE1);                 // Overflow interrupt enable
+  sei();                                  // enable all interrupt
+  Serial.println((String) "l_error " + " vel_l " + " set "  + " r_error " + " vel_r " + " r_set:");
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  lin_vel = 900;
+  delay(1000);
+  lin_vel = 500;
+  delay(1000);
+  lin_vel = 200;
+  delay(1000);
+  lin_vel = 900;
+  delay(1000);
+  lin_vel = 250;
+  delay(1000);
+}
+
+void motion(double lin, double phi )
+{
+  r_v = (2 * lin - phi * wheels_distance) / (2.0); //speed of right wheels
+  l_v = (2 * lin + phi * wheels_distance) / (2.0); //speed of left wheels
+  //to l_vt and r_vt
+  l_vt = l_v * (wheels_encoder / (pi * wheels_diameter)) * sampletime;
+  r_vt = r_v * (wheels_encoder / (pi * wheels_diameter)) * sampletime;
+
+  if (l_vt >= 0) l_dir = clkw; //go ahead
+  else l_dir = c_clkw;      //backhead
+  if (r_vt >= 0) r_dir = clkw;
+  else r_dir = c_clkw;
+
+  l_set = abs(l_vt);
+  r_set = abs(r_vt);
+}
+/*-------------------encoder interrupt 1 ---------------------------------------*/
+void encoder_1()
+{
+  if (!l_dir) l_p ++;
+  else l_p--;
+}
+/*----------------------encoder interrupt 2 ------------------------------------*/
+void encoder_2()
+{
+  if (!r_dir) r_p ++;
+  else r_p--;
+}
+/*--------------------generarte pwm-----------------------------------*/
+void pwmOut(int Lpwm, int Rpwm, bool Ldir, bool Rdir)
+{
+  if (Lpwm == 0 && Rpwm == 0)
+  {
+    analogWrite(M1_p, 0); digitalWrite(M1_l, 0);
+    analogWrite(M2_p, 0); digitalWrite(M2_l, 0);
+  }
+  else if (Ldir == c_clkw && Rdir == c_clkw)
+  {
+    analogWrite(M1_p, 0 - Rpwm); digitalWrite(M1_l, 1);
+    analogWrite(M2_p, 0 - Lpwm); digitalWrite(M2_l, 1);
+  }
+
+  else if (Ldir == clkw && Rdir == clkw)
+  {
+    analogWrite(M1_p, Rpwm); digitalWrite(M1_l, 0);
+    analogWrite(M2_p, Lpwm); digitalWrite(M2_l, 0) ;
+  }
+
+  else if (Ldir == clkw && Rdir == c_clkw)
+  {
+    analogWrite(M1_p, 0 - Rpwm); digitalWrite(M1_l, 1);
+    analogWrite(M2_p, Lpwm); digitalWrite(M2_l, 0);
+  }
+
+  else if (Ldir == c_clkw && Rdir == clkw)
+  {
+    analogWrite(M1_p, Rpwm); digitalWrite(M1_l, 0);
+    analogWrite(M2_p, 0 - Lpwm); digitalWrite(M2_l, 1);
+  }
+}
+/**---------------------------------------------------------------------------------------------------------------**/
+//PID_cal(l_error,l_pre_error,l_integral,l_derivative,l_Ppart,l_Ipart,l_Dpart,l_kP,l_kI,l_kD);
+//PID_cal(r_error,r_pre_error,r_integral,r_derivative,r_Ppart,r_Ipart,r_Dpart,r_kP,r_kI,r_kD);
+//PID_cal(ang_error,ang_pre_error,ang_integral,ang_derivative,ang_Ppart,ang_Ipart,ang_Dpart,p_kP,p_kI,p_kD);
+//PID_cal(lin_error,lin_pre_error,lin_integral,lin_derivative,lin_Ppart,lin_Ipart,lin_Dpart,p_kP,p_kI,p_kD);
+double PID_cal(double error, double pre_error, double _integral, double _derivative, double Ppart, double Ipart, double Dpart, double Kp, double Ki, double Kd)
+{
+  double PID_output;
+  Ppart = Kp * error;
+
+  _integral += error * sampletime;
+  Ipart = Ki * _integral;
+
+  _derivative  = (error  - pre_error ) * inv_sampletime;
+  Dpart  = Kd * _derivative ;
+
+  PID_output = Ppart  + Ipart  + Dpart  ;
+  pre_error  = error ;
+
+  return PID_output;
+}
+/**-------------------------------------------------------------**/
+ISR(TIMER1_OVF_vect)
+{
+  motion(lin_vel, ang_vel);
+  l_error = l_set - abs(l_p);
+  r_error = r_set - abs(r_p);
+  //---------------------------------------fuzzy left wheel------------
+  fuzzy->setInput(1, l_error);
+  fuzzy->fuzzify();
+  out1 = fuzzy->defuzzify(1);
+  out2 = fuzzy->defuzzify(2);
+  l_kI = out2;
+  l_kP = out1;
+  //---------------------------------------fuzzy right wheel-----------
+  fuzzy->setInput(1, r_error);
+  fuzzy->fuzzify();
+  out1 = fuzzy->defuzzify(1);
+  out2 = fuzzy->defuzzify(2);
+  r_kI = out2;
+  r_kP = out1;
+  Serial.println((String) "" + l_error * tinkerbell + " " + l_p * tinkerbell + " " + l_set * tinkerbell + " " + r_error * tinkerbell + " " + r_p * tinkerbell + " " + r_set * tinkerbell);
+  l_out += PID_cal(l_error, l_pre_error, l_integral, l_derivative, l_Ppart, l_Ipart, l_Dpart, l_kP, l_kI, l_kD);
+  r_out += PID_cal(r_error, r_pre_error, r_integral, r_derivative, r_Ppart, r_Ipart, r_Dpart, r_kP, r_kI, r_kD);
+  //---------------------------------------run the car-----------------
+  if (l_set == 0) {
+    l_out = 0;
+    l_dir = c_clkw;
+  }
+  if (r_set == 0) {
+    r_out = 0;
+    r_dir = c_clkw;
+  }
+
+  if (l_out >= 255) l_out = 255;
+  if (r_out >= 255) r_out = 255;
+  pwmOut(l_out, r_out, l_dir, r_dir);
+  l_p = 0;
+  r_p = 0;
+  TCNT1 = timer_set;
+}
+/*-----------------------------------------------------------------*/
